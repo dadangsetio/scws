@@ -8,6 +8,11 @@ export const routes = [
         name: 'home',
         component: () => import('@/views/HomeView.vue'),
       },
+      {
+        path: '/grid',
+        name: 'grid',
+        component: () => import('@/views/GridView.vue'),
+      },
     ],
   },
 ]

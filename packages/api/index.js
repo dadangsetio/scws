@@ -89,23 +89,40 @@ const run = async () => {
 					global.users.set(id, user);
 
 					const deviceAdb = await adbTcpService.getDeviceAdb(device);
+					if (!user.ws) return; // closed before we started anything
 					const { client, options } = await adbTcpService.start(
 						deviceAdb,
 						user,
+						ws,
 					);
 					if (!client) {
 						throw new Error("No ADB TCP CLIENT");
 					}
+					if (!user.ws) {
+						// The browser left while scrcpy was starting (tab closed,
+						// reconnect, React dev double-mount). close() already ran and
+						// saw no client, so stop it here or it keeps encoding on the
+						// device forever.
+						await client.close().catch((e) => logger.error(e));
+						return;
+					}
 					user.client = client;
 
-					client.stdout.pipeTo(
-						new WritableStream({
-							write: (line) => {
-								logger.info(line);
-							},
-						}),
-						{ signal: user.abortController?.signal || undefined },
-					);
+					client.stdout
+						.pipeTo(
+							new WritableStream({
+								write: (line) => {
+									logger.info(line);
+								},
+							}),
+							{ signal: user.abortController?.signal || undefined },
+						)
+						.catch((e) => {
+							if (user?.abortController?.signal?.aborted) {
+								return;
+							}
+							logger.error(e);
+						});
 
 					if (options.clipboard) {
 						options.clipboard
@@ -228,7 +245,16 @@ const run = async () => {
 					}
 				} catch (err) {
 					logger.error(err);
-					ws.close();
+					// `ws` may already be closed here (the client can disconnect while
+					// the async ADB/scrcpy setup above is still in flight, which is what
+					// caused `err` in the first place) — closing an already-closed
+					// uWebSockets.js WebSocket throws synchronously and previously
+					// crashed the whole process.
+					try {
+						ws.close();
+					} catch (closeErr) {
+						logger.error(closeErr);
+					}
 				}
 			},
 			message: (ws, message) => {
@@ -267,9 +293,10 @@ const run = async () => {
 					const user = global.users.get(id);
 					if (user) {
 						if (user.abortController) {
+							// Keep the reference: the pipes' .catch() handlers check
+							// signal.aborted to tell a normal teardown from a real error.
 							try {
-								// user.abortController.abort();
-								user.abortController = undefined;
+								user.abortController.abort();
 							} catch (err) {
 								logger.error(err);
 							}
