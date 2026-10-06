@@ -8,6 +8,7 @@ import Request from "./utils/http/request.js";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { global } from "./state/global.js";
+import { createSetupSlots } from "./setup-slots.js";
 import App from "./utils/http/app.js";
 import { routes } from "./routes/index.js";
 import { cors } from "./utils/http/middie/cors.js";
@@ -25,6 +26,7 @@ const unpacker = new Unpackr(msgpackOptions);
 const host = process.env.HOST || "0.0.0.0";
 const port = process.env.PORT || 9001;
 global.users = new Map();
+const setupSlots = createSetupSlots();
 
 const run = async () => {
 	const app = new App({
@@ -38,8 +40,9 @@ const run = async () => {
 	app.server
 		.ws("/*", {
 			/* Options */
-			compression: uWs.SHARED_COMPRESSOR,
-			maxPayloadLength: 16 * 1024, // 16 * 1024 * 1024
+			// H.264 is already compressed. permessage-deflate only burns CPU.
+			compression: uWs.DISABLED,
+			maxPayloadLength: 16 * 1024 * 1024,
 			idleTimeout: 0,
 			/* Handlers */
 			upgrade: async (res, req, context) => {
@@ -59,17 +62,21 @@ const run = async () => {
 						videoBitRate: ![null, undefined].includes(
 							req.getQuery("videoBitRate"),
 						)
-							? Number.parseInt(req.getQuery("videoBitRate")) * 1000000
-							: 4_000_000,
+							? Math.max(
+									100_000,
+									Math.round(Number.parseFloat(req.getQuery("videoBitRate")) * 1_000_000) ||
+										2_000_000,
+								)
+							: 2_000_000,
 						displayId: ![null, undefined].includes(req.getQuery("displayId"))
 							? Number.parseInt(req.getQuery("displayId"))
 							: 0,
 						maxSize: ![null, undefined].includes(req.getQuery("maxSize"))
 							? Number.parseInt(req.getQuery("maxSize"))
-							: 1280,
+							: 720,
 						maxFps: ![null, undefined].includes(req.getQuery("maxFps"))
 							? Number.parseInt(req.getQuery("maxFps"))
-							: 60,
+							: 30,
 					},
 					/* Use our copies here */
 					req.getHeader("sec-websocket-key"),
@@ -88,13 +95,15 @@ const run = async () => {
 					};
 					global.users.set(id, user);
 
-					const deviceAdb = await adbTcpService.getDeviceAdb(device);
-					if (!user.ws) return; // closed before we started anything
-					const { client, options } = await adbTcpService.start(
-						deviceAdb,
-						user,
-						ws,
-					);
+					const releaseSetup = await setupSlots.acquire(user.abortController.signal);
+					let client, options;
+					try {
+						const deviceAdb = await adbTcpService.getDeviceAdb(device);
+						if (!user.ws) return; // closed before we started anything
+						({ client, options } = await adbTcpService.start(deviceAdb, user, ws));
+					} finally {
+						releaseSetup();
+					}
 					if (!client) {
 						throw new Error("No ADB TCP CLIENT");
 					}
@@ -303,7 +312,7 @@ const run = async () => {
 						}
 
 						user.ws = null;
-						global.users.set(id, {});
+						global.users.delete(id);
 						if (user.client) {
 							await user.client.close();
 						}
