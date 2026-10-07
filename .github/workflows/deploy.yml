@@ -1,0 +1,70 @@
+name: Deploy scws
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image ref
+        id: meta
+        run: echo "image=ghcr.io/${{ github.repository_owner }}/scws:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ghcr.io/${{ github.repository_owner }}/scws:latest
+
+  deploy:
+    name: Deploy to pangdam Kubernetes
+    needs: build
+    runs-on: [self-hosted, pangdam-master]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      STACK_DIR: /opt/docker-compose/fishclaw
+    steps:
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+
+      - name: Import image and roll out the scws Deployment
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+          docker save "${IMAGE}" | sudo k3s ctr -n k8s.io images import -
+          if [[ -f "${STACK_DIR}/compose.yaml" ]]; then
+            cd "${STACK_DIR}"
+            docker compose rm -sf scws scws-adb-reconciler || true
+          fi
+          docker rm -f scws || true
+          sudo k3s kubectl -n fishclaw patch deployment scws --type strategic \
+            -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"scws\",\"image\":\"${IMAGE}\",\"imagePullPolicy\":\"IfNotPresent\",\"ports\":[{\"name\":\"http\",\"containerPort\":4001,\"hostPort\":4001,\"hostIP\":\"127.0.0.1\"}]}]}}}}"
+          sudo k3s kubectl -n fishclaw rollout status deployment/scws --timeout=300s
