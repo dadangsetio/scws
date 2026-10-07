@@ -51,7 +51,7 @@ const run = async () => {
 						url: req.getUrl(),
 						id: req.getQuery("id"),
 						device: req.getQuery("device"),
-						audio: ["true", null, undefined].includes(req.getQuery("audio")),
+						audio: req.getQuery("audio") === "true",
 						audioCodec: req.getQuery("audioCodec") ?? "raw",
 						audioEncoder: req.getQuery("audioEncoder") ?? undefined,
 
@@ -59,24 +59,37 @@ const run = async () => {
 						videoCodec: req.getQuery("videoCodec") ?? "h264",
 						videoEncoder: req.getQuery("videoEncoder") ?? undefined,
 
-						videoBitRate: ![null, undefined].includes(
-							req.getQuery("videoBitRate"),
-						)
-							? Math.max(
-									100_000,
-									Math.round(Number.parseFloat(req.getQuery("videoBitRate")) * 1_000_000) ||
-										2_000_000,
-								)
-							: 2_000_000,
+						videoBitRate: Math.min(
+							1_000_000,
+							Math.max(
+								100_000,
+								![null, undefined].includes(req.getQuery("videoBitRate"))
+									? Math.round(Number.parseFloat(req.getQuery("videoBitRate")) * 1_000_000) ||
+										1_000_000
+									: 1_000_000,
+							),
+						),
 						displayId: ![null, undefined].includes(req.getQuery("displayId"))
 							? Number.parseInt(req.getQuery("displayId"))
 							: 0,
-						maxSize: ![null, undefined].includes(req.getQuery("maxSize"))
-							? Number.parseInt(req.getQuery("maxSize"))
-							: 720,
-						maxFps: ![null, undefined].includes(req.getQuery("maxFps"))
-							? Number.parseInt(req.getQuery("maxFps"))
-							: 30,
+						maxSize: Math.min(
+							720,
+							Math.max(
+								240,
+								![null, undefined].includes(req.getQuery("maxSize"))
+									? Number.parseInt(req.getQuery("maxSize")) || 720
+									: 720,
+							),
+						),
+						maxFps: Math.min(
+							10,
+							Math.max(
+								1,
+								![null, undefined].includes(req.getQuery("maxFps"))
+									? Number.parseInt(req.getQuery("maxFps")) || 10
+									: 10,
+							),
+						),
 					},
 					/* Use our copies here */
 					req.getHeader("sec-websocket-key"),
