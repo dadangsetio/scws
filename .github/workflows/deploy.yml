@@ -50,26 +50,59 @@ jobs:
       IMAGE: ${{ needs.build.outputs.image }}
       STACK_DIR: /opt/docker-compose/fishclaw
     steps:
-      - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
-            --username "${{ github.actor }}" --password-stdin
-
       - name: Import image and roll out the scws Deployment
         run: |
           set -euo pipefail
-          docker pull "${IMAGE}"
-          docker save "${IMAGE}" | sudo k3s ctr -n k8s.io images import -
-          if [[ -f "${STACK_DIR}/compose.yaml" ]]; then
-            cd "${STACK_DIR}"
-            docker compose rm -sf scws scws-adb-reconciler || true
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+          ctr() { sudo -n /usr/local/bin/k3s ctr "$@"; }
+          kubeconfig=""
+          for candidate in \
+            /etc/rancher/k3s/k3s.yaml \
+            /var/lib/rancher/k3s/server/cred/admin.kubeconfig \
+            /etc/kubernetes/admin.conf \
+            /root/.kube/config \
+            /home/ghrunner/.kube/config
+          do
+            if sudo -n /usr/local/bin/kubectl --kubeconfig "$candidate" get ns >/dev/null 2>&1; then
+              kubeconfig="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$kubeconfig" ]]; then
+            echo "no kubeconfig accepted kubectl on $(hostname) as $(id -un)" >&2
+            sudo -n -l >&2 || true
+            exit 1
           fi
-          docker rm -f scws || true
+          kubectl() { sudo -n /usr/local/bin/kubectl --kubeconfig "$kubeconfig" "$@"; }
+
+          docker_bin=()
+          if docker info >/dev/null 2>&1; then
+            docker_bin=(docker)
+          elif sudo -n docker info >/dev/null 2>&1; then
+            docker_bin=(sudo -n docker)
+          fi
+          imported=0
+          if [[ ${#docker_bin[@]} -gt 0 ]]; then
+            if echo "${{ secrets.GITHUB_TOKEN }}" | "${docker_bin[@]}" login ghcr.io \
+              --username "${{ github.actor }}" --password-stdin \
+              && "${docker_bin[@]}" pull "${IMAGE}" \
+              && "${docker_bin[@]}" save "${IMAGE}" | ctr -n k8s.io images import -; then
+              imported=1
+            else
+              echo "docker import failed; pulling ${IMAGE} with k3s ctr" >&2
+            fi
+          else
+            echo "docker client is not usable; pulling ${IMAGE} with k3s ctr"
+          fi
+          if [[ "$imported" -eq 0 ]]; then
+            ctr -n k8s.io images pull --user "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" "${IMAGE}"
+          fi
+
           # 2304Mi / 500m is reserved. The 4Gi / 2 CPU cap stays above live use.
-          sudo k3s kubectl -n fishclaw patch deployment scws --type strategic \
+          kubectl -n fishclaw patch deployment scws --type strategic \
             -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"scws\",\"image\":\"${IMAGE}\",\"imagePullPolicy\":\"IfNotPresent\",\"ports\":[{\"name\":\"http\",\"containerPort\":4001,\"hostPort\":4001,\"hostIP\":\"127.0.0.1\"}],\"resources\":{\"requests\":{\"cpu\":\"500m\",\"memory\":\"2304Mi\"},\"limits\":{\"cpu\":\"2\",\"memory\":\"4Gi\"}}}]}}}}"
-          if ! sudo k3s kubectl -n fishclaw rollout status deployment/scws --timeout=300s; then
-            sudo k3s kubectl -n fishclaw rollout undo deployment/scws
-            sudo k3s kubectl -n fishclaw rollout status deployment/scws --timeout=300s || true
+          if ! kubectl -n fishclaw rollout status deployment/scws --timeout=300s; then
+            kubectl -n fishclaw rollout undo deployment/scws
+            kubectl -n fishclaw rollout status deployment/scws --timeout=300s || true
             exit 1
           fi
