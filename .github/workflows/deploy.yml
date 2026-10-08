@@ -65,6 +65,11 @@ jobs:
             docker compose rm -sf scws scws-adb-reconciler || true
           fi
           docker rm -f scws || true
+          # 2304Mi / 500m is reserved. The 4Gi / 2 CPU cap stays above live use.
           sudo k3s kubectl -n fishclaw patch deployment scws --type strategic \
-            -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"scws\",\"image\":\"${IMAGE}\",\"imagePullPolicy\":\"IfNotPresent\",\"ports\":[{\"name\":\"http\",\"containerPort\":4001,\"hostPort\":4001,\"hostIP\":\"127.0.0.1\"}]}]}}}}"
-          sudo k3s kubectl -n fishclaw rollout status deployment/scws --timeout=300s
+            -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"scws\",\"image\":\"${IMAGE}\",\"imagePullPolicy\":\"IfNotPresent\",\"ports\":[{\"name\":\"http\",\"containerPort\":4001,\"hostPort\":4001,\"hostIP\":\"127.0.0.1\"}],\"resources\":{\"requests\":{\"cpu\":\"500m\",\"memory\":\"2304Mi\"},\"limits\":{\"cpu\":\"2\",\"memory\":\"4Gi\"}}}]}}}}"
+          if ! sudo k3s kubectl -n fishclaw rollout status deployment/scws --timeout=300s; then
+            sudo k3s kubectl -n fishclaw rollout undo deployment/scws
+            sudo k3s kubectl -n fishclaw rollout status deployment/scws --timeout=300s || true
+            exit 1
+          fi

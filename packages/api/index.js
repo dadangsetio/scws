@@ -28,6 +28,28 @@ const port = process.env.PORT || 9001;
 global.users = new Map();
 const setupSlots = createSetupSlots();
 
+// A thrown socket or ADB error must not be the thing that exits the process.
+// PM2 restarts a worker that still manages to abort; these handlers cover the
+// JavaScript failures that used to take the stream down with it.
+process.on("uncaughtException", (err) => {
+	logger.error(err);
+});
+process.on("unhandledRejection", (err) => {
+	logger.error(err);
+});
+
+function sendPacked(user, payload) {
+	const socket = user?.ws;
+	if (!socket) return;
+	try {
+		const ok = socket.send(packer.pack(payload), true);
+		if (ok !== 1) logger.info(`WS not sent with status: ${ok}`);
+	} catch (ex) {
+		logger.error(ex);
+		user.ws = null;
+	}
+}
+
 const run = async () => {
 	const app = new App({
 		host,
@@ -111,9 +133,25 @@ const run = async () => {
 					const releaseSetup = await setupSlots.acquire(user.abortController.signal);
 					let client, options;
 					try {
-						const deviceAdb = await adbTcpService.getDeviceAdb(device);
-						if (!user.ws) return; // closed before we started anything
-						({ client, options } = await adbTcpService.start(deviceAdb, user, ws));
+						const maxAttempts = 5;
+						for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+							try {
+								const deviceAdb = await adbTcpService.getDeviceAdb(device);
+								if (!user.ws) return; // closed before we started anything
+								({ client, options } = await adbTcpService.start(deviceAdb, user, ws));
+								if (client) break;
+								throw new Error("No ADB TCP CLIENT");
+							} catch (startErr) {
+								logger.error(startErr);
+								if (attempt >= maxAttempts || !user.ws) throw startErr;
+								logger.info(
+									`Redroid stream retry ${attempt}/${maxAttempts} for ${device}`,
+								);
+								await new Promise((resolve) =>
+									setTimeout(resolve, Math.min(1000 * attempt, 5000)),
+								);
+							}
+						}
 					} finally {
 						releaseSetup();
 					}
@@ -151,20 +189,7 @@ const run = async () => {
 							.pipeTo(
 								new WritableStream({
 									write: (message) => {
-										try {
-											const array = packer.pack({
-												media: "message",
-												message,
-											});
-											if (user.ws) {
-												const ok = user.ws?.send(array, true);
-												if (ok !== 1) {
-													logger.info(`WS not sent with status: ${ok}`);
-												}
-											}
-										} catch (ex) {
-											logger.error(ex);
-										}
+										sendPacked(user, { media: "message", message });
 									},
 								}),
 								{ signal: user.abortController?.signal || undefined },
@@ -196,18 +221,7 @@ const run = async () => {
 									.pipeTo(
 										new WritableStream({
 											write(packet) {
-												try {
-													const array = packer.pack({
-														media: "audio",
-														packet,
-													});
-													if (user.ws) {
-														ok = user.ws?.send(array, true);
-														if (!ok) logger.info("not ok", ok);
-													}
-												} catch (ex) {
-													logger.error(ex);
-												}
+												sendPacked(user, { media: "audio", packet });
 											},
 										}),
 										{ signal: user.abortController?.signal || undefined },
@@ -227,33 +241,16 @@ const run = async () => {
 						const { metadata: videoMetadata, stream: videoPacketStream } =
 							await client.videoStream;
 						logger.info(videoMetadata);
-						const array = packer.pack({
+						sendPacked(user, {
 							media: "video_metadata",
 							packet: videoMetadata,
 						});
-						let ok = user.ws?.send(array, true);
-						if (ok !== 1) {
-							logger.info(`WS not sent with status: ${ok}`);
-						}
 
 						videoPacketStream
 							.pipeTo(
 								new WritableStream({
 									write(packet) {
-										try {
-											const array = packer.pack({
-												media: "video",
-												packet,
-											});
-											if (user.ws) {
-												ok = user.ws?.send(array, true);
-												if (ok !== 1) {
-													logger.info(`WS not sent with status: ${ok}`);
-												}
-											}
-										} catch (ex) {
-											logger.error(ex);
-										}
+										sendPacked(user, { media: "video", packet });
 									},
 								}),
 								{ signal: user.abortController?.signal || undefined },
@@ -363,7 +360,20 @@ const run = async () => {
 				);
 			});
 		});
-	await app.start();
+	for (let attempt = 1; attempt <= 30; attempt++) {
+		try {
+			await app.start();
+			return;
+		} catch (err) {
+			logger.error(err);
+			logger.info(`scws listen retry ${attempt}/30`);
+			await new Promise((resolve) =>
+				setTimeout(resolve, Math.min(1000 * attempt, 10000)),
+			);
+		}
+	}
+	logger.error("scws could not listen; PM2 will start it again");
+	process.exit(1);
 };
 
 run();

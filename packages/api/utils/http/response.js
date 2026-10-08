@@ -38,6 +38,23 @@ const Response = function (res, req, route, request) {
 	});
 };
 
+// uWebSockets frees the HttpResponse when the client leaves. A later
+// write/tryEnd/end outside cork() aborts V8 (GetCreationContextChecked,
+// exit 133) and takes the whole stream server down.
+Response.prototype._invoke = function (fn, fallback) {
+	if (this.aborted || !this.res) return fallback;
+	try {
+		return this.res.cork(() => {
+			if (this.aborted) return fallback;
+			return fn();
+		});
+	} catch (err) {
+		this.aborted = true;
+		console.error("uWS response write skipped:", err?.message || err);
+		return fallback;
+	}
+};
+
 Response.prototype.getProxiedRemoteAddress = function () {
 	this.res.getProxiedRemoteAddress();
 	return this;
@@ -152,7 +169,10 @@ Response.prototype.sendFile = function (
 };
 
 Response.prototype.pipe = function (stream, size, compressed = false) {
-	this.onAborted(() => {
+	// Replaces the constructor abort handler. Must still mark aborted, or the
+	// file stream keeps writing into a freed HttpResponse.
+	this.res.onAborted(() => {
+		this.aborted = true;
 		if (stream) {
 			stream.destroy();
 		}
@@ -268,22 +288,20 @@ Response.prototype.cork = function (cb) {
 	return this;
 };
 Response.prototype.end = function (body) {
-	this.writeHeaders();
-	this.writeStatus(`${this._status}`);
-	if (!this.aborted) {
+	return this._invoke(() => {
+		this.writeHeaders();
+		this.writeStatus(`${this._status}`);
+		if (this.aborted) return this;
 		this.aborted = true;
 		return this.res.end(body);
-	}
-
-	return this;
+	}, this);
 };
 Response.prototype.endOnly = function (body) {
-	if (!this.aborted) {
+	return this._invoke(() => {
+		if (this.aborted) return this;
 		this.aborted = true;
 		return this.res.end(body);
-	}
-	console.log('uWs debugging: "end" aborted ');
-	return this;
+	}, this);
 };
 Response.prototype.endWithoutBody = function (
 	reportedContentLength,
@@ -317,10 +335,11 @@ Response.prototype.resume = function () {
 	}
 };
 Response.prototype.tryEnd = function (fullBodyOrChunk, totalSize) {
-	if (!this.aborted) {
-		return this.res.tryEnd(fullBodyOrChunk, totalSize);
-	}
-	return [true, true];
+	const result = this._invoke(
+		() => this.res.tryEnd(fullBodyOrChunk, totalSize),
+		[true, true],
+	);
+	return Array.isArray(result) ? result : [true, true];
 };
 Response.prototype.upgrade = function (
 	userData,
@@ -340,19 +359,15 @@ Response.prototype.upgrade = function (
 	}
 };
 Response.prototype.write = function (chunk) {
-	if (!this.aborted) this.res.write(chunk);
+	this._invoke(() => this.res.write(chunk));
 	return false;
 };
 Response.prototype.writeHeader = function (key, value) {
-	if (!this.aborted) {
-		return this.res.writeHeader(key, value);
-	}
+	this._invoke(() => this.res.writeHeader(key, value));
 	return this;
 };
 Response.prototype.writeStatus = function (status) {
-	if (!this.aborted) {
-		return this.res.writeStatus(status);
-	}
+	this._invoke(() => this.res.writeStatus(status));
 	return this;
 };
 Response.prototype.get = function (index) {

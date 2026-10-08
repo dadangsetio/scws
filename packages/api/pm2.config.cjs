@@ -15,7 +15,13 @@ module.exports = {
 			script: "index.js",
 			watch: false,
 			instances: "max",
-			autorestart: false,
+			// A V8 abort in one worker must come back. The old false setting
+			// left the stream server dead after the cork/write crash.
+			autorestart: true,
+			max_restarts: 100000,
+			min_uptime: 10000,
+			restart_delay: 1000,
+			exp_backoff_restart_delay: 200,
 			exec_mode: "cluster",
 			env: {
 				HOST: "0.0.0.0",
